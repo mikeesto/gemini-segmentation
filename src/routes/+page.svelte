@@ -156,7 +156,7 @@
 
 			<p class="mt-4 text-center text-sm text-gray-500">
 				This app uses a very experimental model. If processing fails, please try again with a
-				different image or target.
+				different image or object name.
 			</p>
 		</div>
 	</div>

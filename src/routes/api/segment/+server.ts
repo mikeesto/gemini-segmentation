@@ -19,6 +19,7 @@ export async function POST({ request }) {
 		// 1. Handle file upload
 		const formData = await request.formData();
 		const file = formData.get('file');
+		const target = formData.get('target');
 
 		if (!file) {
 			return new Response(JSON.stringify({ error: 'No file uploaded' }), {
@@ -45,8 +46,7 @@ export async function POST({ request }) {
 
 		// 3. Make API call to Gemini
 		const ai = new GoogleGenAI({ apiKey: env.GOOGLE_API_KEY });
-		const prompt =
-			'Give the segmentation mask for the pelican. Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key "box_2d", and the segmentation mask in key "mask".';
+		const prompt = `Give the segmentation mask for the ${target}. Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key "box_2d", and the segmentation mask in key "mask".`;
 
 		const base64Image = (await fs.readFile(tempResizedPath)).toString('base64');
 		const response = await ai.models.generateContent({
