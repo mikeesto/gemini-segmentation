@@ -9,9 +9,12 @@ const execPromise = promisify(exec);
 const MAX_IMAGE_WIDTH = 1024;
 const MAX_IMAGE_HEIGHT = 1024;
 const OUTPUT_QUALITY = 80;
-const MASK_THRESHOLD = '50%';
+const MASK_THRESHOLD = '50%'; // White >= 50%, Black < 50%
 
 export async function POST({ request }) {
+	const tempDir = '/tmp';
+	const timestamp = Date.now();
+
 	try {
 		// 1. Handle file upload
 		const formData = await request.formData();
@@ -26,10 +29,8 @@ export async function POST({ request }) {
 
 		// 2. Process input image
 		const arrayBuffer = await file.arrayBuffer();
-		const tempDir = '/tmp';
-		const timestamp = Date.now();
-
-		const tempInputPath = path.join(tempDir, `input_${timestamp}.png`);
+		const inputFilename = `input_${timestamp}.${file.name.split('.').pop() || 'png'}`;
+		const tempInputPath = path.join(tempDir, inputFilename);
 		await fs.writeFile(tempInputPath, Buffer.from(arrayBuffer));
 
 		// Resize input image
@@ -38,13 +39,14 @@ export async function POST({ request }) {
 			`convert "${tempInputPath}" -resize ${MAX_IMAGE_WIDTH}x${MAX_IMAGE_HEIGHT} -quality ${OUTPUT_QUALITY} "${tempResizedPath}"`
 		);
 
-		// Get image dimensions
+		// Get image dimensions after resizing
 		const { stdout: sizeInfo } = await execPromise(`identify -format "%wx%h" "${tempResizedPath}"`);
 		const [imageWidth, imageHeight] = sizeInfo.split('x').map(Number);
 
-		// 3. Call AI for segmentation
+		// 3. Make API call to Gemini
 		const ai = new GoogleGenAI({ apiKey: env.GOOGLE_API_KEY });
-		const prompt = 'Give the segmentation masks for the pelican...';
+		const prompt =
+			'Give the segmentation mask for the pelican. Output a JSON list of segmentation masks where each entry contains the 2D bounding box in the key "box_2d", and the segmentation mask in key "mask".';
 
 		const base64Image = (await fs.readFile(tempResizedPath)).toString('base64');
 		const response = await ai.models.generateContent({
@@ -62,34 +64,56 @@ export async function POST({ request }) {
 
 		// 4. Parse AI response
 		const responseText = response.text;
-		const regex =
-			/"box_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\s*,\s*"mask"\s*:\s*"(data:image\/[^;]+;base64,[^"]+)"/;
-		const match = responseText.match(regex);
+		let match;
+		try {
+			const cleanedText = responseText.replace(/^```json\s*|```$/g, '').trim();
+			const parsedJson = JSON.parse(cleanedText);
+			const firstItem = Array.isArray(parsedJson) ? parsedJson[0] : parsedJson;
+			if (firstItem && firstItem.box_2d && firstItem.mask) {
+				match = [
+					null, // Placeholder for full match string
+					...firstItem.box_2d, // yMin, xMin, yMax, xMax
+					firstItem.mask // data:image/png;base64,...
+				];
+			}
+		} catch (jsonError) {
+			console.warn('Could not parse AI response as JSON, falling back to regex:', jsonError);
+			const regex =
+				/"box_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\][\s\S]*?"mask"\s*:\s*"(data:image\/png;base64,[^"]+)"/i;
+			match = responseText.match(regex);
+		}
 
-		if (!match) throw new Error('Could not extract mask from AI response');
+		if (!match || match.length < 6) {
+			console.error('AI Response Text:', responseText);
+			throw new Error('Could not extract coordinates and mask from AI response');
+		}
 
-		// 5. Convert coordinates
-		const [yMin, xMin, yMax, xMax] = match
-			.slice(1, 5)
-			.map((val, i) =>
-				Math.max(
-					0,
-					Math.min(
-						Math.round((parseInt(val, 10) / 1000) * (i % 2 ? imageWidth : imageHeight)),
-						(i % 2 ? imageWidth : imageHeight) - 1
-					)
-				)
-			);
+		// 5. Convert coordinates (Normalized 0-1000 to Pixel values)
+		const normYMin = parseInt(match[1], 10);
+		const normXMin = parseInt(match[2], 10);
+		const normYMax = parseInt(match[3], 10);
+		const normXMax = parseInt(match[4], 10);
 
-		const boxWidth = Math.min(xMax - xMin, imageWidth - xMin);
-		const boxHeight = Math.min(yMax - yMin, imageHeight - yMin);
+		const clamp = (val) => Math.max(0, Math.min(1000, val));
 
-		// 6. Process mask with ImageMagick
-		const maskBase64 = match[5].split(',')[1];
+		const yMin = Math.max(0, Math.round((clamp(normYMin) / 1000) * imageHeight));
+		const xMin = Math.max(0, Math.round((clamp(normXMin) / 1000) * imageWidth));
+		const yMax = Math.min(imageHeight, Math.round((clamp(normYMax) / 1000) * imageHeight));
+		const xMax = Math.min(imageWidth, Math.round((clamp(normXMax) / 1000) * imageWidth));
+
+		const boxWidth = Math.max(1, xMax - xMin);
+		const boxHeight = Math.max(1, yMax - yMin);
+
+		// 6. Process mask data from Gemini response
+		const maskDataUrl = match[5];
+		if (!maskDataUrl.startsWith('data:image/png;base64,')) {
+			throw new Error('Mask data is not a valid PNG base64 Data URL');
+		}
+		const maskBase64 = maskDataUrl.split(',')[1];
 		const tempMaskPath = path.join(tempDir, `mask_${timestamp}.png`);
 		await fs.writeFile(tempMaskPath, Buffer.from(maskBase64, 'base64'));
 
-		// Process mask - resize and threshold (don't invert yet)
+		// Process the raw mask: Resize to bounding box, threshold (White = Object), make grayscale
 		const tempProcessedMaskPath = path.join(tempDir, `processed_mask_${timestamp}.png`);
 		await execPromise(
 			`convert "${tempMaskPath}" ` +
@@ -99,31 +123,25 @@ export async function POST({ request }) {
 				`"${tempProcessedMaskPath}"`
 		);
 
-		// 7. Create full-size alpha mask (INVERTED - white where plant is)
+		// 7. Create a full-size alpha mask: Black background, place white processed mask at offset
 		const tempFullMaskPath = path.join(tempDir, `full_mask_${timestamp}.png`);
-		console.log(
-			`Creating full mask: ${imageWidth}x${imageHeight}, drawing processed mask at +${xMin}+${yMin}`
-		);
 		await execPromise(
 			`convert -size ${imageWidth}x${imageHeight} xc:black ` + // Start with black (transparent for CopyOpacity)
 				`-draw "image Over ${xMin},${yMin} 0,0 '${tempProcessedMaskPath}'" ` + // Draw the small white mask onto black bg
-				// `-gravity NorthWest -draw "image Over ${xMin},${yMin} 0,0 '${tempProcessedMaskPath}'" ` + // Alternative drawing
 				`"${tempFullMaskPath}"`
 		);
-		// tempFiles.push(tempFullMaskPath);
 
-		// 8. Apply mask to original image to extract plant
+		// 8. Apply the full mask to the original image using CopyOpacity, then crop to the bounding box
 		const tempOutputPath = path.join(tempDir, `output_${timestamp}.png`);
-		console.log(`Applying mask and cropping to: ${boxWidth}x${boxHeight}+${xMin}+${yMin}`);
 		await execPromise(
-			`convert "${tempResizedPath}" "${tempFullMaskPath}" ` + // Original image and the CORRECT full mask
+			`convert "${tempResizedPath}" "${tempFullMaskPath}" ` + // Original image and the full mask
 				`-alpha off -compose CopyOpacity -composite ` + // Apply mask (makes bg transparent)
 				`-crop ${boxWidth}x${boxHeight}+${xMin}+${yMin} ` + // CROP to the bounding box
 				`+repage ` + // Reset canvas offset after crop
 				`"${tempOutputPath}"` // Save the final cropped PNG
 		);
 
-		// Read final image
+		// 9. Read final image
 		const finalImage = await fs.readFile(tempOutputPath);
 
 		// Clean up temp files
